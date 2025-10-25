@@ -20,6 +20,7 @@ AstraVault is a decentralized inheritance protocol built on Stacks that enables 
 - **NFT Inheritance**: Support for non-fungible token inheritance across chains
 - **External Asset References**: Track and manage assets on external blockchains
 - **Flexible Conditions**: Support for both time-based and signature-based inheritance triggers
+- **Enhanced Validation**: Comprehensive input validation and error handling throughout
 
 ## 🏗️ Architecture
 
@@ -237,8 +238,18 @@ clarinet test
 - `u121`: Recovery not found
 - `u122`: Recovery expired
 - `u123`: Invalid guardian
+- `u124`: Invalid allocation percentage
+- `u125`: Invalid recovery threshold
 
 ## 🛡️ Security Features
+
+### Enhanced Input Validation (v1.1)
+- **Vault ID Validation**: All vault operations now validate vault IDs before processing
+- **Asset ID Validation**: Asset operations verify asset IDs exist and are valid
+- **Allocation Validation**: Beneficiary allocations checked for valid percentage ranges (1-100%)
+- **Recovery Threshold Validation**: Guardian thresholds verified against actual guardian count
+- **Inactivity Threshold Validation**: Vault creation validates inactivity periods are within allowed ranges
+- **Required Signatures Validation**: Multi-sig requirements validated on vault creation
 
 ### Emergency Recovery Security
 - Guardian identity validation and authorization checks
@@ -252,6 +263,11 @@ clarinet test
 - Blockchain ID verification for external assets
 - Contract address validation for tokens and NFTs
 - External address format validation
+
+### Read-Only Function Safety
+- All read-only functions validate input parameters before querying data
+- Proper handling of optional values prevents unchecked data access
+- Consistent validation patterns across all query functions
 
 ### Enhanced Validation
 - Comprehensive parameter validation for all inputs
@@ -276,6 +292,8 @@ The contract includes comprehensive error handling and validation:
 - Multi-signature validation for different scenarios
 - Activity tracking accuracy for all operations
 - Recovery time window and expiration testing
+- Input validation coverage for all public functions
+- Read-only function parameter validation
 
 ## 🔗 Multi-Chain Integration
 
@@ -323,3 +341,18 @@ The architecture supports easy addition of new:
 - Time-locked execution allows for dispute resolution
 - Signature tracking ensures authentic guardian participation
 - Recovery expiration prevents indefinite pending requests
+
+## 📝 Changelog
+
+### Version 1.1.0 - Enhanced Validation & Security
+- Added comprehensive input validation for all public functions
+- Enhanced vault ID validation across all operations
+- Improved asset ID validation in read-only functions
+- Added allocation percentage validation (1-100% range)
+- Implemented recovery threshold validation against guardian count
+- Added inactivity threshold validation on vault creation
+- Enhanced read-only functions with parameter validation
+- Fixed potential unchecked data warnings
+- Improved error handling with new error codes (ERR_INVALID_ALLOCATION, ERR_INVALID_RECOVERY_THRESHOLD)
+- Optimized claim calculation with intermediate variables
+- Ensured all functions pass `clarinet check` without warnings
