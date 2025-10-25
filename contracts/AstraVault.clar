@@ -19,6 +19,16 @@
 (define-constant ERR_INVALID_TOKEN_ID (err u113))
 (define-constant ERR_ASSET_NOT_FOUND (err u114))
 (define-constant ERR_INVALID_CONTRACT_ADDRESS (err u115))
+(define-constant ERR_GUARDIAN_ALREADY_EXISTS (err u116))
+(define-constant ERR_MAX_GUARDIANS_REACHED (err u117))
+(define-constant ERR_GUARDIAN_NOT_FOUND (err u118))
+(define-constant ERR_INSUFFICIENT_GUARDIAN_SIGNATURES (err u119))
+(define-constant ERR_RECOVERY_ALREADY_INITIATED (err u120))
+(define-constant ERR_RECOVERY_NOT_FOUND (err u121))
+(define-constant ERR_RECOVERY_EXPIRED (err u122))
+(define-constant ERR_INVALID_GUARDIAN (err u123))
+(define-constant ERR_INVALID_ALLOCATION (err u124))
+(define-constant ERR_INVALID_RECOVERY_THRESHOLD (err u125))
 
 ;; Asset type constants
 (define-constant ASSET_TYPE_STX u1)
@@ -39,6 +49,9 @@
 (define-data-var min-inactivity-period uint u144) ;; ~1 day in blocks
 (define-data-var max-inactivity-period uint u52560) ;; ~1 year in blocks
 (define-data-var next-asset-id uint u1)
+(define-data-var max-guardians-per-vault uint u5)
+(define-data-var recovery-period uint u1008) ;; ~7 days in blocks
+(define-data-var next-recovery-id uint u1)
 
 ;; Data Maps
 (define-map vaults
@@ -51,7 +64,8 @@
         is-active: bool,
         is-claimed: bool,
         required-signatures: uint,
-        total-assets: uint
+        total-assets: uint,
+        recovery-threshold: uint
     }
 )
 
@@ -94,17 +108,46 @@
     { count: uint }
 )
 
+;; Emergency Recovery Maps
+(define-map vault-guardians
+    { vault-id: uint, guardian: principal }
+    {
+        added-at: uint,
+        is-active: bool,
+        has-signed-recovery: bool
+    }
+)
+
+(define-map guardian-count
+    { vault-id: uint }
+    { count: uint }
+)
+
+(define-map recovery-requests
+    { vault-id: uint }
+    {
+        recovery-id: uint,
+        new-owner: principal,
+        initiated-at: uint,
+        expires-at: uint,
+        signatures-count: uint,
+        is-executed: bool
+    }
+)
+
+(define-map guardian-recovery-signatures
+    { vault-id: uint, guardian: principal, recovery-id: uint }
+    { signed-at: uint }
+)
+
 ;; Private Functions
 (define-private (get-current-block-height)
     stacks-block-height
 )
 
 (define-private (is-vault-owner (vault-id uint) (user principal))
-    (if (> vault-id u0)
-        (match (map-get? vaults { vault-id: vault-id })
-            vault (is-eq (get owner vault) user)
-            false
-        )
+    (match (map-get? vaults { vault-id: vault-id })
+        vault (is-eq (get owner vault) user)
         false
     )
 )
@@ -114,13 +157,10 @@
 )
 
 (define-private (is-inactivity-threshold-met (vault-id uint))
-    (if (> vault-id u0)
-        (match (map-get? vaults { vault-id: vault-id })
-            vault 
-            (let ((inactivity-blocks (calculate-inactivity-blocks (get last-activity vault))))
-                (>= inactivity-blocks (get inactivity-threshold vault))
-            )
-            false
+    (match (map-get? vaults { vault-id: vault-id })
+        vault 
+        (let ((inactivity-blocks (calculate-inactivity-blocks (get last-activity vault))))
+            (>= inactivity-blocks (get inactivity-threshold vault))
         )
         false
     )
@@ -150,6 +190,21 @@
 (define-private (increment-asset-count (vault-id uint))
     (let ((current-count (get-asset-count vault-id)))
         (map-set asset-count 
+            { vault-id: vault-id }
+            { count: (+ current-count u1) }
+        )
+    )
+)
+
+(define-private (get-guardian-count (vault-id uint))
+    (default-to u0 
+        (get count (map-get? guardian-count { vault-id: vault-id }))
+    )
+)
+
+(define-private (increment-guardian-count (vault-id uint))
+    (let ((current-count (get-guardian-count vault-id)))
+        (map-set guardian-count 
             { vault-id: vault-id }
             { count: (+ current-count u1) }
         )
@@ -195,17 +250,41 @@
     (and (> asset-id u0) (< asset-id (var-get next-asset-id)))
 )
 
+(define-private (validate-recovery-threshold (threshold uint) (total-guardians uint))
+    (and (> threshold u0) (<= threshold total-guardians) (>= total-guardians u1))
+)
+
+(define-private (is-recovery-expired (recovery-data {recovery-id: uint, new-owner: principal, initiated-at: uint, expires-at: uint, signatures-count: uint, is-executed: bool}))
+    (> (get-current-block-height) (get expires-at recovery-data))
+)
+
+(define-private (is-vault-guardian (vault-id uint) (guardian principal))
+    (match (map-get? vault-guardians { vault-id: vault-id, guardian: guardian })
+        guardian-data (get is-active guardian-data)
+        false
+    )
+)
+
+(define-private (validate-inactivity-threshold (threshold uint))
+    (and (>= threshold (var-get min-inactivity-period))
+         (<= threshold (var-get max-inactivity-period)))
+)
+
+(define-private (validate-required-signatures (signatures uint))
+    (> signatures u0)
+)
+
 ;; Public Functions
 
 ;; Create a new inheritance vault
-(define-public (create-vault (inactivity-threshold uint) (required-signatures uint))
+(define-public (create-vault (inactivity-threshold uint) (required-signatures uint) (recovery-threshold uint))
     (let (
         (vault-id (var-get next-vault-id))
         (current-block (get-current-block-height))
     )
-        (asserts! (and (>= inactivity-threshold (var-get min-inactivity-period))
-                      (<= inactivity-threshold (var-get max-inactivity-period))) ERR_INVALID_TIMELOCK)
-        (asserts! (> required-signatures u0) ERR_NOT_AUTHORIZED)
+        (asserts! (validate-inactivity-threshold inactivity-threshold) ERR_INVALID_TIMELOCK)
+        (asserts! (validate-required-signatures required-signatures) ERR_NOT_AUTHORIZED)
+        (asserts! (> recovery-threshold u0) ERR_INVALID_RECOVERY_THRESHOLD)
         (asserts! (is-none (map-get? vault-owners { owner: tx-sender })) ERR_VAULT_ALREADY_EXISTS)
         
         (map-set vaults
@@ -218,7 +297,8 @@
                 is-active: true,
                 is-claimed: false,
                 required-signatures: required-signatures,
-                total-assets: u0
+                total-assets: u0,
+                recovery-threshold: recovery-threshold
             }
         )
         
@@ -233,6 +313,11 @@
         )
         
         (map-set asset-count
+            { vault-id: vault-id }
+            { count: u0 }
+        )
+        
+        (map-set guardian-count
             { vault-id: vault-id }
             { count: u0 }
         )
@@ -403,13 +488,15 @@
 ;; Add a beneficiary to a vault
 (define-public (add-beneficiary (vault-id uint) (beneficiary principal) (allocation-percentage uint) (can-claim-early bool))
     (let (
+        (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR_VAULT_NOT_FOUND))
         (current-count (get-beneficiary-count vault-id))
         (current-block (get-current-block-height))
     )
+        (asserts! (validate-vault-id vault-id) ERR_VAULT_NOT_FOUND)
         (asserts! (is-vault-owner vault-id tx-sender) ERR_NOT_AUTHORIZED)
-        (asserts! (is-some (map-get? vaults { vault-id: vault-id })) ERR_VAULT_NOT_FOUND)
+        (asserts! (get is-active vault) ERR_VAULT_NOT_FOUND)
         (asserts! (< current-count (var-get max-beneficiaries-per-vault)) ERR_MAX_BENEFICIARIES_REACHED)
-        (asserts! (validate-allocation-percentage allocation-percentage) ERR_INVALID_BENEFICIARY)
+        (asserts! (validate-allocation-percentage allocation-percentage) ERR_INVALID_ALLOCATION)
         (asserts! (not (is-eq beneficiary tx-sender)) ERR_INVALID_BENEFICIARY)
         (asserts! (is-none (map-get? vault-beneficiaries { vault-id: vault-id, beneficiary: beneficiary })) ERR_BENEFICIARY_ALREADY_EXISTS)
         
@@ -424,7 +511,167 @@
         )
         
         (increment-beneficiary-count vault-id)
+        
+        (map-set vaults
+            { vault-id: vault-id }
+            (merge vault { last-activity: current-block })
+        )
+        
         (ok true)
+    )
+)
+
+;; Add a guardian to a vault for emergency recovery
+(define-public (add-guardian (vault-id uint) (guardian principal))
+    (let (
+        (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR_VAULT_NOT_FOUND))
+        (current-count (get-guardian-count vault-id))
+        (current-block (get-current-block-height))
+    )
+        (asserts! (validate-vault-id vault-id) ERR_VAULT_NOT_FOUND)
+        (asserts! (is-vault-owner vault-id tx-sender) ERR_NOT_AUTHORIZED)
+        (asserts! (get is-active vault) ERR_VAULT_NOT_FOUND)
+        (asserts! (< current-count (var-get max-guardians-per-vault)) ERR_MAX_GUARDIANS_REACHED)
+        (asserts! (not (is-eq guardian tx-sender)) ERR_INVALID_GUARDIAN)
+        (asserts! (is-none (map-get? vault-guardians { vault-id: vault-id, guardian: guardian })) ERR_GUARDIAN_ALREADY_EXISTS)
+        
+        (map-set vault-guardians
+            { vault-id: vault-id, guardian: guardian }
+            {
+                added-at: current-block,
+                is-active: true,
+                has-signed-recovery: false
+            }
+        )
+        
+        (increment-guardian-count vault-id)
+        
+        (map-set vaults
+            { vault-id: vault-id }
+            (merge vault { last-activity: current-block })
+        )
+        
+        (ok true)
+    )
+)
+
+;; Initiate emergency recovery
+(define-public (initiate-recovery (vault-id uint) (new-owner principal))
+    (let (
+        (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR_VAULT_NOT_FOUND))
+        (guardian-data (unwrap! (map-get? vault-guardians { vault-id: vault-id, guardian: tx-sender }) ERR_NOT_AUTHORIZED))
+        (recovery-id (var-get next-recovery-id))
+        (current-block (get-current-block-height))
+        (expiry-block (+ current-block (var-get recovery-period)))
+        (guardian-count-data (get-guardian-count vault-id))
+    )
+        (asserts! (validate-vault-id vault-id) ERR_VAULT_NOT_FOUND)
+        (asserts! (get is-active vault) ERR_VAULT_NOT_FOUND)
+        (asserts! (get is-active guardian-data) ERR_NOT_AUTHORIZED)
+        (asserts! (not (is-eq new-owner (get owner vault))) ERR_INVALID_GUARDIAN)
+        (asserts! (is-none (map-get? recovery-requests { vault-id: vault-id })) ERR_RECOVERY_ALREADY_INITIATED)
+        (asserts! (validate-recovery-threshold (get recovery-threshold vault) guardian-count-data) ERR_INVALID_RECOVERY_THRESHOLD)
+        
+        (map-set recovery-requests
+            { vault-id: vault-id }
+            {
+                recovery-id: recovery-id,
+                new-owner: new-owner,
+                initiated-at: current-block,
+                expires-at: expiry-block,
+                signatures-count: u1,
+                is-executed: false
+            }
+        )
+        
+        (map-set guardian-recovery-signatures
+            { vault-id: vault-id, guardian: tx-sender, recovery-id: recovery-id }
+            { signed-at: current-block }
+        )
+        
+        (map-set vault-guardians
+            { vault-id: vault-id, guardian: tx-sender }
+            (merge guardian-data { has-signed-recovery: true })
+        )
+        
+        (var-set next-recovery-id (+ recovery-id u1))
+        (ok recovery-id)
+    )
+)
+
+;; Sign recovery request as guardian
+(define-public (sign-recovery (vault-id uint))
+    (let (
+        (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR_VAULT_NOT_FOUND))
+        (guardian-data (unwrap! (map-get? vault-guardians { vault-id: vault-id, guardian: tx-sender }) ERR_NOT_AUTHORIZED))
+        (recovery-data (unwrap! (map-get? recovery-requests { vault-id: vault-id }) ERR_RECOVERY_NOT_FOUND))
+        (current-block (get-current-block-height))
+    )
+        (asserts! (validate-vault-id vault-id) ERR_VAULT_NOT_FOUND)
+        (asserts! (get is-active vault) ERR_VAULT_NOT_FOUND)
+        (asserts! (get is-active guardian-data) ERR_NOT_AUTHORIZED)
+        (asserts! (not (get has-signed-recovery guardian-data)) ERR_NOT_AUTHORIZED)
+        (asserts! (not (get is-executed recovery-data)) ERR_RECOVERY_NOT_FOUND)
+        (asserts! (not (is-recovery-expired recovery-data)) ERR_RECOVERY_EXPIRED)
+        (asserts! (is-none (map-get? guardian-recovery-signatures { vault-id: vault-id, guardian: tx-sender, recovery-id: (get recovery-id recovery-data) })) ERR_NOT_AUTHORIZED)
+        
+        (map-set guardian-recovery-signatures
+            { vault-id: vault-id, guardian: tx-sender, recovery-id: (get recovery-id recovery-data) }
+            { signed-at: current-block }
+        )
+        
+        (map-set vault-guardians
+            { vault-id: vault-id, guardian: tx-sender }
+            (merge guardian-data { has-signed-recovery: true })
+        )
+        
+        (map-set recovery-requests
+            { vault-id: vault-id }
+            (merge recovery-data { signatures-count: (+ (get signatures-count recovery-data) u1) })
+        )
+        
+        (ok true)
+    )
+)
+
+;; Execute recovery after sufficient signatures
+(define-public (execute-recovery (vault-id uint))
+    (let (
+        (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR_VAULT_NOT_FOUND))
+        (recovery-data (unwrap! (map-get? recovery-requests { vault-id: vault-id }) ERR_RECOVERY_NOT_FOUND))
+        (current-block (get-current-block-height))
+        (old-owner (get owner vault))
+        (new-owner-principal (get new-owner recovery-data))
+    )
+        (asserts! (validate-vault-id vault-id) ERR_VAULT_NOT_FOUND)
+        (asserts! (get is-active vault) ERR_VAULT_NOT_FOUND)
+        (asserts! (not (get is-executed recovery-data)) ERR_RECOVERY_NOT_FOUND)
+        (asserts! (not (is-recovery-expired recovery-data)) ERR_RECOVERY_EXPIRED)
+        (asserts! (>= (get signatures-count recovery-data) (get recovery-threshold vault)) ERR_INSUFFICIENT_GUARDIAN_SIGNATURES)
+        
+        ;; Update vault owner
+        (map-set vaults
+            { vault-id: vault-id }
+            (merge vault { 
+                owner: new-owner-principal,
+                last-activity: current-block
+            })
+        )
+        
+        ;; Update owner mapping
+        (map-delete vault-owners { owner: old-owner })
+        (map-set vault-owners
+            { owner: new-owner-principal }
+            { vault-id: vault-id }
+        )
+        
+        ;; Mark recovery as executed
+        (map-set recovery-requests
+            { vault-id: vault-id }
+            (merge recovery-data { is-executed: true })
+        )
+        
+        (ok new-owner-principal)
     )
 )
 
@@ -434,6 +681,7 @@
         (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR_VAULT_NOT_FOUND))
         (current-block (get-current-block-height))
     )
+        (asserts! (validate-vault-id vault-id) ERR_VAULT_NOT_FOUND)
         (asserts! (is-vault-owner vault-id tx-sender) ERR_NOT_AUTHORIZED)
         (asserts! (get is-active vault) ERR_VAULT_NOT_FOUND)
         
@@ -451,7 +699,7 @@
         (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR_VAULT_NOT_FOUND))
         (beneficiary-data (unwrap! (map-get? vault-beneficiaries { vault-id: vault-id, beneficiary: tx-sender }) ERR_NOT_AUTHORIZED))
     )
-        (asserts! (> vault-id u0) ERR_VAULT_NOT_FOUND)
+        (asserts! (validate-vault-id vault-id) ERR_VAULT_NOT_FOUND)
         (asserts! (get is-active vault) ERR_VAULT_NOT_FOUND)
         (asserts! (not (get has-signed beneficiary-data)) ERR_NOT_AUTHORIZED)
         
@@ -469,7 +717,9 @@
         (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR_VAULT_NOT_FOUND))
         (beneficiary-data (unwrap! (map-get? vault-beneficiaries { vault-id: vault-id, beneficiary: tx-sender }) ERR_NOT_AUTHORIZED))
         (asset (unwrap! (map-get? vault-assets { vault-id: vault-id, asset-id: asset-id }) ERR_ASSET_NOT_FOUND))
-        (claimable-amount (/ (* (get amount asset) (get allocation-percentage beneficiary-data)) u100))
+        (asset-amount (get amount asset))
+        (allocation-pct (get allocation-percentage beneficiary-data))
+        (claimable-amount (/ (* asset-amount allocation-pct) u100))
     )
         (asserts! (validate-vault-id vault-id) ERR_VAULT_NOT_FOUND)
         (asserts! (validate-asset-id asset-id) ERR_ASSET_NOT_FOUND)
@@ -481,18 +731,20 @@
         
         ;; Check if inactivity threshold is met OR early claim with signature
         (asserts! (or 
-            (and (is-some (map-get? vaults { vault-id: vault-id })) (is-inactivity-threshold-met vault-id))
+            (is-inactivity-threshold-met vault-id)
             (and (get can-claim-early beneficiary-data) (get has-signed beneficiary-data))
         ) ERR_TIMELOCK_NOT_EXPIRED)
         
         (try! (as-contract (stx-transfer? claimable-amount tx-sender tx-sender)))
         
-        (map-set vault-assets
-            { vault-id: vault-id, asset-id: asset-id }
-            (merge asset { 
-                amount: (- (get amount asset) claimable-amount),
-                is-active: (> (- (get amount asset) claimable-amount) u0)
-            })
+        (let ((new-amount (- asset-amount claimable-amount)))
+            (map-set vault-assets
+                { vault-id: vault-id, asset-id: asset-id }
+                (merge asset { 
+                    amount: new-amount,
+                    is-active: (> new-amount u0)
+                })
+            )
         )
         (ok claimable-amount)
     )
@@ -515,15 +767,41 @@
 
 ;; Get beneficiary information
 (define-read-only (get-beneficiary-info (vault-id uint) (beneficiary principal))
-    (map-get? vault-beneficiaries { vault-id: vault-id, beneficiary: beneficiary })
+    (if (validate-vault-id vault-id)
+        (map-get? vault-beneficiaries { vault-id: vault-id, beneficiary: beneficiary })
+        none
+    )
+)
+
+;; Get guardian information
+(define-read-only (get-guardian-info (vault-id uint) (guardian principal))
+    (if (validate-vault-id vault-id)
+        (map-get? vault-guardians { vault-id: vault-id, guardian: guardian })
+        none
+    )
+)
+
+;; Get recovery request information
+(define-read-only (get-recovery-info (vault-id uint))
+    (if (validate-vault-id vault-id)
+        (map-get? recovery-requests { vault-id: vault-id })
+        none
+    )
+)
+
+;; Check if guardian has signed recovery
+(define-read-only (has-guardian-signed-recovery (vault-id uint) (guardian principal) (recovery-id uint))
+    (if (validate-vault-id vault-id)
+        (is-some (map-get? guardian-recovery-signatures { vault-id: vault-id, guardian: guardian, recovery-id: recovery-id }))
+        false
+    )
 )
 
 ;; Check if vault can be claimed due to inactivity
 (define-read-only (can-claim-due-to-inactivity (vault-id uint))
-    (and 
-        (> vault-id u0)
-        (is-some (map-get? vaults { vault-id: vault-id }))
+    (if (validate-vault-id vault-id)
         (is-inactivity-threshold-met vault-id)
+        false
     )
 )
 
@@ -534,13 +812,14 @@
 
 ;; Get remaining inactivity blocks
 (define-read-only (get-remaining-inactivity-blocks (vault-id uint))
-    (if (and (> vault-id u0) (is-some (map-get? vaults { vault-id: vault-id })))
+    (if (validate-vault-id vault-id)
         (match (map-get? vaults { vault-id: vault-id })
             vault 
-            (let ((elapsed-blocks (calculate-inactivity-blocks (get last-activity vault))))
-                (if (>= elapsed-blocks (get inactivity-threshold vault))
+            (let ((elapsed-blocks (calculate-inactivity-blocks (get last-activity vault)))
+                  (threshold (get inactivity-threshold vault)))
+                (if (>= elapsed-blocks threshold)
                     u0
-                    (- (get inactivity-threshold vault) elapsed-blocks)
+                    (- threshold elapsed-blocks)
                 )
             )
             u0
@@ -551,10 +830,44 @@
 
 ;; Get total number of beneficiaries for a vault
 (define-read-only (get-vault-beneficiary-count (vault-id uint))
-    (get-beneficiary-count vault-id)
+    (if (validate-vault-id vault-id)
+        (get-beneficiary-count vault-id)
+        u0
+    )
 )
 
 ;; Get total number of assets for a vault
 (define-read-only (get-vault-asset-count (vault-id uint))
-    (get-asset-count vault-id)
+    (if (validate-vault-id vault-id)
+        (get-asset-count vault-id)
+        u0
+    )
+)
+
+;; Get total number of guardians for a vault
+(define-read-only (get-vault-guardian-count (vault-id uint))
+    (if (validate-vault-id vault-id)
+        (get-guardian-count vault-id)
+        u0
+    )
+)
+
+;; Check if recovery can be executed
+(define-read-only (can-execute-recovery (vault-id uint))
+    (if (validate-vault-id vault-id)
+        (match (map-get? recovery-requests { vault-id: vault-id })
+            recovery-data
+            (match (map-get? vaults { vault-id: vault-id })
+                vault
+                (and 
+                    (not (get is-executed recovery-data))
+                    (not (is-recovery-expired recovery-data))
+                    (>= (get signatures-count recovery-data) (get recovery-threshold vault))
+                )
+                false
+            )
+            false
+        )
+        false
+    )
 )
